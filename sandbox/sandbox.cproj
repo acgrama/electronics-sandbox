@@ -133,7 +133,7 @@
     </ToolchainSettings>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="main.c">
+    <Compile Include="pwm.c">
       <SubType>compile</SubType>
     </Compile>
     <Compile Include="timer.c">
