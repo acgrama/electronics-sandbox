@@ -332,10 +332,6 @@ void updateScreen() {
   }
 }
 
-/*************************************************
-* Random number generator related functions
-*************************************************/
-
 
 int main(void) {
   cli();
