@@ -1,5 +1,5 @@
 /*
- * Pixel bouncing demo on graphics LCD 128x64 (KS0108 controller)
+ * Pixel moving with joystick demo on graphics LCD 128x64 (KS0108 controller)
  * with ATmega1284P
  *
  * ---------------------
@@ -14,6 +14,10 @@
  * - CS1 PORTB3
  * - CS2 PORTB4
  * - nRST PORTB5
+ *
+ * Misc:
+ * - Joystick VRx PORTA0
+ * - Joystick VRy PORTA1
  * ---------------------
  *
  * Created: 16.06.2018
@@ -43,9 +47,8 @@ volatile uint8_t buffer[1024];
 // The current coordinates of the pixel
 volatile uint8_t posx, posy;
 
-// The current deltas for each direction
-// They change to -1 when their direction changes!
-volatile int8_t deltax = 1, deltay = 1;
+// The current direction, based on the joystick actions
+volatile uint8_t dir;
 
 // Lookup table of all possible bitmasks with one bit
 const uint8_t bitmasks[8] = { 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80 };
@@ -53,6 +56,12 @@ const uint8_t bitmasks[8] = { 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80 };
 // Flag that is set to true when the period between two screen refreshes has passed
 // If this is equal to 1, it means the time has come to refresh the screen with the updated screen buffer
 volatile uint8_t displayNowFlag;
+
+// The converted value of the Rx joystick voltage
+volatile uint16_t rxadc;
+
+// The converted value of the Ry joystick voltage
+volatile uint16_t ryadc;
 
 /*
  * Sets up TIMER0 for waveform generation delays:
@@ -103,14 +112,47 @@ void sleepTicks(uint8_t delay) {
 /*
  * Initial set-up:
  * - Sets port directions
- * - Disables UART (we are using Arduino pins 0 and 1, which are RX and TX, respectively)
  */
 void setUp() {
   // Set PORTB as output
   DDRB = 0B11111111;
-  // Disable fucking UART!!!
-  UCSR0B = 0x00;
+  // Set PORTA as input
+  DDRA = 0B00000000;
 }
+
+/*
+  Sets up ADC in free running mode
+ */
+void setupADC() {
+  // 0. Disable digital input buffer on ADC0 and ADC1
+  // (since we will use analog inputs A0 and A1 to read the joystick axes)
+  DIDR0 |= (1 << ADC0D) & (1 << ADC1D);
+  
+  // 1. Select the channel
+  // We set it up to use ADC0, which is MUX[3:0]=0000
+  // We will switch between ADC0 and ADC1 in the ADC interrupt
+  // 2. Select the voltage reference
+  // We use AREF, which is 00
+  ADMUX = 0B00000000;
+  
+  // 3. Set the ADC prescaler to 64 ADPS[2:0]=110
+  ADCSRA = (1 << ADPS2) | (1 << ADPS1);
+  
+  // 4. Set it to free running mode (0000)
+  ADCSRB = 0B00000000;
+  
+  // 5. Set the ADIE, for the ADC ISR
+  ADCSRA |= (1 << ADIE);
+  
+  // 6. Set the auto trigger option on
+  ADCSRA |= (1 << ADATE);
+  
+  // 7. Enable ADC
+  ADCSRA |= (1 << ADEN);
+  
+  // 8. Start conversion
+  ADCSRA |= (1 << ADSC);
+} 
 
 /*
  * Resets the LCD by setting the nRST = 0, waiting min tRS = 1us, setting nRST = 1
@@ -280,41 +322,24 @@ void clearPixel(uint8_t posX, uint8_t posY) {
 }
 
 /*
- * Checks whether a position together with a direction of
- * movement signifies a "wall hit". For instance, going in
- * a southward direction and reaching y = 63 (bottom wall)
- * or x = 127 (right wall).
- *
- * @param x The pixel coordinate x
- * @param y The pixel coordinate y
- * @return 1 if it is a hit, 0 otherwise
- */
-uint8_t isWallHit(uint8_t x, uint8_t y) {
-  return ((deltax < 0) && (x == 0)) || ((deltax > 0) && (x == 127)) || ((deltay < 0) && (y == 0)) || ((deltay > 0) && (y == 63));
-}
-
-/*
- * Changes the direction, i.e. the deltax or deltay
- * @param x The pixel coordinate x
- * @param y The pixel coordinate y
- */
-void changeDir(uint8_t x, uint8_t y) {
-  if ((x == 0) || (x == 127))
-    deltax = -deltax;
-  if ((y == 0) || (y == 63))
-    deltay = -deltay;
-}
-
-/*
- * Moves the pixel one position in the current direction.
- * Whoever invokes this function must guarantee that we are
- * not "falling off" the screen in doing so.
+ * Moves the pixel based on the joystick inputs, minding the walls.
  */
 void movePixel() {
-  if (isWallHit(posx, posy))
-    changeDir(posx, posy);
-  posx += deltax;
-  posy += deltay;
+  // Set the increment / decrement values for posx and posy based on joystick inputs
+  // Allow for a bandwidth [lowerNopBound, upperNopBound] around the middle value 512
+  // where nothing happens (otherwise the joystick is too sensitive)
+  uint16_t lowerNopBound = 475;
+  uint16_t upperNopBound = 549;
+  if (rxadc < lowerNopBound) {
+    posx = (posx > 0) ? (posx - 1) : posx;
+  } else if (rxadc > upperNopBound) {
+    posx = (posx < 127) ? (posx + 1) : posx;
+  }
+  if (ryadc < lowerNopBound) {
+    posy = (posy < 63) ? (posy + 1) : posy;
+  } else if (ryadc > upperNopBound) {
+    posy = (posy > 0) ? (posy - 1) : posy;
+  }
 }
 
 /*
@@ -350,6 +375,8 @@ int main(void)
   timerSetup();
   // Set up the timer used in controlling screen refresh rate
   displayTimerSetup();
+  // Set up the ADC
+  setupADC();
   sei();
   setUp();
   sleepTicks(STD_SLEEP_TICKS);
@@ -381,4 +408,23 @@ int main(void)
 // Invoked every 100ms, sets the displayNowFlag
 ISR(TIMER1_COMPA_vect) {
   displayNowFlag = 1;
+}
+
+/*
+  The ISR which is invoked when an ADC conversion is finished
+ */
+ISR(ADC_vect) {
+  // Copy the converted value into our volatile variable
+  // Based on which analog input we are reading the value from
+  switch (ADMUX) {
+    case 0x00:
+      rxadc = (uint16_t)ADC;
+      ADMUX = 0x01;
+      break;
+    case 0x01:
+      ryadc = (uint16_t)ADC;
+      ADMUX = 0x00;
+      break;
+  }
+  ADCSRA |= (1 << ADSC);
 }
