@@ -1,8 +1,8 @@
 /*
- * Pixel moving with joystick demo on graphics LCD 128x64 (KS0108 controller)
- * with ATmega1284P
+ * Pixel drawing with joystick on graphics LCD 128x64 (KS0108 controller)
+ * with ATmega1284P (f_clk = 20 MHz).
  *
- * ---------------------
+ * -------------------------
  * Connections
  * Data pins:
  * - DB0:DB7 on PORTD0:7
@@ -18,7 +18,8 @@
  * Misc:
  * - Joystick VRx PORTA0
  * - Joystick VRy PORTA1
- * ---------------------
+ * - Joystick button PORTC7
+ * -------------------------
  *
  * Created: 16.06.2018
  * Author : Cristina Einramhof-Grama
@@ -31,7 +32,7 @@
 /* --- Global variables, e.g. for interrupt service routines --- */
 volatile uint8_t ucPortCValue;
 
-// By default, sleep duration is 16 timer ticks = 1 us
+// By default, sleep duration is 16 timer ticks = 0.8 us
 #define STD_SLEEP_TICKS 16
 
 // Bit mask used to set CS1 in a control byte
@@ -63,31 +64,45 @@ volatile uint16_t rxadc;
 // The converted value of the Ry joystick voltage
 volatile uint16_t ryadc;
 
+// Captures the event that the joystick button has been pressed down
+volatile uint8_t buttonDown = 0;
+
+// Pen up / down -- toggled by the joystick button
+volatile uint8_t penUp = 0;
+
 /*
  * Sets up TIMER0 for waveform generation delays:
- * - no prescaler
- * - normal mode of operation
+ * COM0A1 = 0, COM0A0 = 0, COM0B1 = 0, COM0B0 = 0 => Normal port operation, OC0A / OC0B disconnected
+ * WGM0[2:0] = 000 => Timer / Counter Mode of Operation = Normal
+ * FOC0A = 0, FOC0B = 0 => Force Output Compare A/B = Disabled
+ * CS0[2:0] = 001 => No prescaling (clk_io / 1)
  */
 void timerSetup() {
   TCNT0 = 0B00000000;
-  // COM0A1 = 0, COM0A0 = 0, COM0B1 = 0, COM0B0 = 0, WGM01 = 0, WGM00 = 0
+  // COM0A1 = 0, COM0A0 = 0, COM0B1 = 0, COM0B0 = 0
+  // WGM01 = 0, WGM00 = 0
   TCCR0A = 0B00000000;
   // FOC0A = 0, FOC0B = 0, WGM02 = 0, CS0[0:2] = 001
   TCCR0B = 0B00000001;
 }
 
 /*
- * Sets up TIMER1 for delays needed to keep the screen display non-jittery
+ * Sets up TIMER1 for delays needed to keep the screen display non-jittery (f = 10Hz)
  * - prescaler value = 256
- * - CTC Mode (Clear Timer on Compare Match)
  * - we want an interrupt generated every time we reach the TOP count value
+ * COM1A1 = 0, COM1A0 = 0, COM1B1 = 0, COM1B0 = 0 => Normal port operation, OC1A / OC1B disconnected
+ * WGM1[3:0] = 0100 => Timer / Counter Mode of Operation is CTC (Clear Timer on Compare Match)
+ * ICNC1 = 1 => Input Capture Noise Canceler enabled
+ * ICES1 = 1 => Input Capture Edge Select -> rising edge triggers the capture
+ * CS1[2:0] = 100 => clk_io / 256
+ * TIMSK1 has OCIE1A = 1 => Output Compare A Match Interrupt Enable
+ * OCR1A => desired TOP value to achieve f = 10 Hz
  */
 void displayTimerSetup() {
   // Initialise the Timer 1 registers
   // COM1A1 = 0, COM1A0 = 0, COM1B1 = 0, COM1B0 = 0, 0, 0, WGM11 = 0, WGM10 = 0
   TCCR1A = 0B00000000;
   
-  // We use TIMER1 in CTC mode, so WGM1[2:0] = 100
   // Set prescaler value to 256: CS1[2:0] = 100
   // ICNC1 = 0, ICES1 = 0, 0, WGM13 = 0, WGM12 = 1, CS12 = 1, CS11 = 0, CS10 = 0
   TCCR1B = 0B00001100;
@@ -96,12 +111,12 @@ void displayTimerSetup() {
   TIMSK1 |= (1 << OCIE1A);
   
   // Set compare match register to desired value for 10Hz frequency
-  OCR1A = 6250; 
+  OCR1A = 7813; 
 }
 
 /*
  * Sleeps for a specified delay of time, given in timer ticks.
- * Since we use no prescaler, 1 timer tick = 1 T_clk = 1 / f_clk = 0.0625us
+ * Since we use no prescaler, 1 timer tick = 1 T_clk = 1 / f_clk = 0.05us
  * @param delay Number of timer ticks
  */
 void sleepTicks(uint8_t delay) {
@@ -110,14 +125,15 @@ void sleepTicks(uint8_t delay) {
 }
 
 /*
- * Initial set-up:
- * - Sets port directions
+ * Initial set-up: sets port directions
  */
 void setUp() {
   // Set PORTB as output
   DDRB = 0B11111111;
   // Set PORTA as input
   DDRA = 0B00000000;
+  // Set PORTC as input
+  DDRC = 0B00000000;  
 }
 
 /*
@@ -155,8 +171,7 @@ void setupADC() {
 } 
 
 /*
- * Resets the LCD by setting the nRST = 0, waiting min tRS = 1us, setting nRST = 1
- * In practice, we wait a bit longer
+ * Resets the LCD by setting the nRST = 0, waiting for some time (min tRS, cf. datasheet), setting nRST = 1
  */
 void resetLcd(void) {
   // nRST = 0 (PB5), CS2 = 0 (PB4), CS1 = 0 (PB3), E = 0 (PB2), R/nW = 0 (PB1), D/nI = 0 (PB0)
@@ -307,7 +322,10 @@ uint16_t computeBufferIndex(uint8_t posX, uint8_t posY) {
 void setPixel(uint8_t posX, uint8_t posY) {
   uint8_t bitmask = computeBitmask(posY);
   uint16_t index = computeBufferIndex(posX, posY);
-  buffer[index] = bitmask;
+  if (penUp)
+    buffer[index] = bitmask;
+  else
+    buffer[index] |= bitmask;
 }
 
 /*
@@ -387,15 +405,32 @@ int main(void)
   clearScreenBuffer();
   posx = 0;
   posy = 0;
+  penUp = 1;
   setPixel(posx, posy);
   while (1) {
     if (displayNowFlag) {
+      // Keep the pushbutton detection inside the display loop
+      // To make sure we are not checking the button state at full f_clk
+      // and pick up the button bounces like that
+      
+      // If we have C7 = 1, we are in the buttonUp state
+      if (PINC & 0x80) {
+        if (buttonDown) {
+          penUp = !penUp;
+          buttonDown = 0;
+        }
+      } else {
+        // If we have C7 = 0, we have a buttonDown event
+        buttonDown = 1;
+      }
       // Set the flag to false
       displayNowFlag = 0;
       // Send precomputed frame to LCD
       updateScreen();
-      // Precompute next frame
-      clearPixel(posx, posy);
+      // Precompute next frame, deleting last position only if the pen is up
+      if (penUp) {
+        clearPixel(posx, posy);
+      }
       movePixel();
       setPixel(posx, posy);
     }
